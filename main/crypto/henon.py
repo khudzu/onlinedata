@@ -1,5 +1,6 @@
 import base64
 import json
+import secrets
 
 import cv2
 import numpy as np
@@ -7,6 +8,10 @@ import numpy as np
 
 DEFAULT_A = 5
 DEFAULT_B = 7
+LEGACY_ALG = "Henon-Map-Block2"
+SECURE_ALG = "Henon-Map-Permutation-XOR-v2"
+DEFAULT_CHAOS_A = 1.4
+DEFAULT_CHAOS_B = 0.3
 
 
 def _b64encode(data):
@@ -29,9 +34,13 @@ def generate_henon_key(a=DEFAULT_A, b=DEFAULT_B):
     _modinv(b)
     return json.dumps(
         {
-            "alg": "Henon-Map-Block2",
-            "a": int(a),
-            "b": int(b),
+            "alg": SECURE_ALG,
+            "block_a": int(a),
+            "block_b": int(b),
+            "chaos_a": DEFAULT_CHAOS_A,
+            "chaos_b": DEFAULT_CHAOS_B,
+            "x0": round((secrets.randbelow(800000) + 100000) / 1000000, 6),
+            "y0": round((secrets.randbelow(800000) + 100000) / 1000000, 6),
         },
         separators=(",", ":"),
     )
@@ -39,16 +48,91 @@ def generate_henon_key(a=DEFAULT_A, b=DEFAULT_B):
 
 def is_henon_key(payload):
     try:
-        return json.loads(payload).get("alg") == "Henon-Map-Block2"
+        return json.loads(payload).get("alg") in {LEGACY_ALG, SECURE_ALG}
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
 
 
-def _load_key(payload):
+def _load_key_data(payload):
     data = json.loads(payload)
-    if data.get("alg") != "Henon-Map-Block2":
+    if data.get("alg") not in {LEGACY_ALG, SECURE_ALG}:
         raise ValueError("Not a Henon key payload.")
-    return int(data.get("a", DEFAULT_A)), int(data.get("b", DEFAULT_B))
+    return data
+
+
+def _load_block_key(payload):
+    data = _load_key_data(payload)
+    return (
+        int(data.get("block_a", data.get("a", DEFAULT_A))),
+        int(data.get("block_b", data.get("b", DEFAULT_B))),
+    )
+
+
+def _load_secure_key(payload):
+    data = _load_key_data(payload)
+    return {
+        "alg": data.get("alg"),
+        "block_a": int(data.get("block_a", data.get("a", DEFAULT_A))),
+        "block_b": int(data.get("block_b", data.get("b", DEFAULT_B))),
+        "chaos_a": float(data.get("chaos_a", DEFAULT_CHAOS_A)),
+        "chaos_b": float(data.get("chaos_b", DEFAULT_CHAOS_B)),
+        "x0": float(data.get("x0", 0.314159)),
+        "y0": float(data.get("y0", 0.271828)),
+    }
+
+
+def _henon_sequence(length, x0, y0, a=DEFAULT_CHAOS_A, b=DEFAULT_CHAOS_B):
+    sequence = np.empty(length, dtype=np.float64)
+    x = float(x0)
+    y = float(y0)
+    warmup = 128
+    index = 0
+
+    for step in range(length + warmup):
+        x_new = 1.0 - a * x * x + y
+        y_new = b * x
+        x, y = x_new, y_new
+        if not np.isfinite(x) or not np.isfinite(y):
+            x = (float(x0) % 1.0) + 0.123457
+            y = (float(y0) % 1.0) + 0.765431
+        if step >= warmup:
+            sequence[index] = x + (0.5 * y)
+            index += 1
+
+    return sequence
+
+
+def _keystream_and_permutation(length, key):
+    sequence = _henon_sequence(
+        length * 2,
+        key["x0"],
+        key["y0"],
+        key["chaos_a"],
+        key["chaos_b"],
+    )
+    stream_source = sequence[:length]
+    permutation_source = sequence[length:]
+    keystream = (np.floor(np.abs(np.sin(stream_source) * 10**14)) % 256).astype(np.uint8)
+    permutation = np.argsort(permutation_source, kind="mergesort")
+    return keystream, permutation
+
+
+def _encrypt_image_secure(img, key):
+    base_cipher = henon_encrypt_image(img, key["block_a"], key["block_b"])
+    flat = base_cipher.reshape(-1)
+    keystream, permutation = _keystream_and_permutation(flat.size, key)
+    cipher_flat = np.bitwise_xor(flat[permutation], keystream)
+    return cipher_flat.reshape(base_cipher.shape).astype(np.uint8)
+
+
+def _decrypt_image_secure(cipher, key):
+    flat = cipher.reshape(-1)
+    keystream, permutation = _keystream_and_permutation(flat.size, key)
+    shuffled = np.bitwise_xor(flat, keystream)
+    base_flat = np.empty_like(shuffled)
+    base_flat[permutation] = shuffled
+    base_cipher = base_flat.reshape(cipher.shape).astype(np.uint8)
+    return henon_decrypt_image(base_cipher, key["block_a"], key["block_b"])
 
 
 def _encrypt_byte_pairs(data, a, b):
@@ -128,7 +212,7 @@ def henon_decrypt_image(cipher, a=DEFAULT_A, b=DEFAULT_B):
 
 
 def encrypt_text(plaintext, key_payload):
-    a, b = _load_key(key_payload)
+    a, b = _load_block_key(key_payload)
     ciphertext, padding = _encrypt_byte_pairs(str(plaintext).encode("utf-8"), a, b)
     return json.dumps(
         {
@@ -145,7 +229,7 @@ def decrypt_text(payload, key_payload):
         data = json.loads(payload)
         if data.get("alg") != "Henon-Map-Block2-Text":
             return payload
-        a, b = _load_key(key_payload)
+        a, b = _load_block_key(key_payload)
         plaintext = _decrypt_byte_pairs(
             _b64decode(data["ciphertext"]),
             a,
@@ -158,12 +242,15 @@ def decrypt_text(payload, key_payload):
 
 
 def encrypt_image_bytes(image_bytes, key_payload):
-    a, b = _load_key(key_payload)
+    key = _load_secure_key(key_payload)
     image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("Image bytes could not be decoded.")
 
-    encrypted_image = henon_encrypt_image(image, a, b)
+    if key["alg"] == SECURE_ALG:
+        encrypted_image = _encrypt_image_secure(image, key)
+    else:
+        encrypted_image = henon_encrypt_image(image, key["block_a"], key["block_b"])
     ok, buffer = cv2.imencode(".png", encrypted_image)
     if not ok:
         raise ValueError("Encrypted image could not be encoded.")
@@ -185,13 +272,16 @@ def decrypt_image_bytes(payload, key_payload):
     if data.get("alg") != "Henon-Map-Block2-Image":
         raise ValueError("Not a Henon image payload.")
 
-    a, b = _load_key(key_payload)
+    key = _load_secure_key(key_payload)
     encrypted_png = _b64decode(data["ciphertext"])
     encrypted_image = cv2.imdecode(np.frombuffer(encrypted_png, np.uint8), cv2.IMREAD_COLOR)
     if encrypted_image is None:
         raise ValueError("Encrypted image could not be decoded.")
 
-    decrypted_image = henon_decrypt_image(encrypted_image, a, b)
+    if key["alg"] == SECURE_ALG:
+        decrypted_image = _decrypt_image_secure(encrypted_image, key)
+    else:
+        decrypted_image = henon_decrypt_image(encrypted_image, key["block_a"], key["block_b"])
     ok, buffer = cv2.imencode(".png", decrypted_image)
     if not ok:
         raise ValueError("Decrypted image could not be encoded.")
