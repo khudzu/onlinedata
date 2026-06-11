@@ -10,6 +10,9 @@ DEFAULT_A = 5
 DEFAULT_B = 7
 LEGACY_ALG = "Henon-Map-Block2"
 SECURE_ALG = "Henon-Map-Permutation-XOR-v2"
+HILL_HENON_ALG = "Hill-Cipher-Henon-Map"
+HILL_HENON_TEXT_ALG = "Hill-Cipher-Henon-Map-Text"
+HILL_HENON_IMAGE_ALG = "Hill-Cipher-Henon-Map-Image"
 DEFAULT_CHAOS_A = 1.4
 DEFAULT_CHAOS_B = 0.3
 
@@ -34,9 +37,9 @@ def generate_henon_key(a=DEFAULT_A, b=DEFAULT_B):
     _modinv(b)
     return json.dumps(
         {
-            "alg": SECURE_ALG,
-            "block_a": int(a),
-            "block_b": int(b),
+            "alg": HILL_HENON_ALG,
+            "hill_a": 2,
+            "hill_b": 3,
             "chaos_a": DEFAULT_CHAOS_A,
             "chaos_b": DEFAULT_CHAOS_B,
             "x0": round((secrets.randbelow(800000) + 100000) / 1000000, 6),
@@ -48,14 +51,14 @@ def generate_henon_key(a=DEFAULT_A, b=DEFAULT_B):
 
 def is_henon_key(payload):
     try:
-        return json.loads(payload).get("alg") in {LEGACY_ALG, SECURE_ALG}
+        return json.loads(payload).get("alg") in {LEGACY_ALG, SECURE_ALG, HILL_HENON_ALG}
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
 
 
 def _load_key_data(payload):
     data = json.loads(payload)
-    if data.get("alg") not in {LEGACY_ALG, SECURE_ALG}:
+    if data.get("alg") not in {LEGACY_ALG, SECURE_ALG, HILL_HENON_ALG}:
         raise ValueError("Not a Henon key payload.")
     return data
 
@@ -74,6 +77,8 @@ def _load_secure_key(payload):
         "alg": data.get("alg"),
         "block_a": int(data.get("block_a", data.get("a", DEFAULT_A))),
         "block_b": int(data.get("block_b", data.get("b", DEFAULT_B))),
+        "hill_a": int(data.get("hill_a", 2)),
+        "hill_b": int(data.get("hill_b", 3)),
         "chaos_a": float(data.get("chaos_a", DEFAULT_CHAOS_A)),
         "chaos_b": float(data.get("chaos_b", DEFAULT_CHAOS_B)),
         "x0": float(data.get("x0", 0.314159)),
@@ -117,6 +122,49 @@ def _keystream_and_permutation(length, key):
     return keystream, permutation
 
 
+def _henon_permutation(length, key):
+    sequence = _henon_sequence(
+        length,
+        key["x0"],
+        key["y0"],
+        key["chaos_a"],
+        key["chaos_b"],
+    )
+    return np.argsort(sequence, kind="mergesort")
+
+
+def _hill_matrix(a, b):
+    return np.array([[1, a], [b, a * b + 1]], dtype=np.int64)
+
+
+def _hill_inverse_matrix(a, b):
+    return np.array([[a * b + 1, -a], [-b, 1]], dtype=np.int64) % 256
+
+
+def _hill_transform_bytes(data, matrix, padding=0):
+    values = np.frombuffer(data, dtype=np.uint8)
+    added_padding = 0
+    if values.size % 2 == 1:
+        values = np.pad(values, (0, 1), mode="constant")
+        added_padding = 1
+
+    pairs = values.reshape(-1, 2).astype(np.int64)
+    transformed = (pairs @ matrix.T) % 256
+    flattened = transformed.astype(np.uint8).reshape(-1)
+    if padding:
+        flattened = flattened[:-int(padding)]
+    return flattened.tobytes(), added_padding
+
+
+def _hill_encrypt_bytes(data, a, b):
+    return _hill_transform_bytes(data, _hill_matrix(a, b))
+
+
+def _hill_decrypt_bytes(data, a, b, padding=0):
+    plain, _ = _hill_transform_bytes(data, _hill_inverse_matrix(a, b), padding)
+    return plain
+
+
 def _encrypt_image_secure(img, key):
     base_cipher = henon_encrypt_image(img, key["block_a"], key["block_b"])
     flat = base_cipher.reshape(-1)
@@ -133,6 +181,41 @@ def _decrypt_image_secure(cipher, key):
     base_flat[permutation] = shuffled
     base_cipher = base_flat.reshape(cipher.shape).astype(np.uint8)
     return henon_decrypt_image(base_cipher, key["block_a"], key["block_b"])
+
+
+def _encrypt_image_hill_henon(img, key):
+    flat = img.reshape(-1)
+    if flat.size % 2 == 1:
+        hill_bytes, _ = _hill_encrypt_bytes(flat[:-1].tobytes(), key["hill_a"], key["hill_b"])
+        hill_flat = np.concatenate([np.frombuffer(hill_bytes, dtype=np.uint8), flat[-1:]])
+    else:
+        hill_bytes, _ = _hill_encrypt_bytes(flat.tobytes(), key["hill_a"], key["hill_b"])
+        hill_flat = np.frombuffer(hill_bytes, dtype=np.uint8)
+    permutation = _henon_permutation(hill_flat.size, key)
+    cipher_flat = hill_flat[permutation]
+    return cipher_flat.reshape(img.shape).astype(np.uint8)
+
+
+def _decrypt_image_hill_henon(cipher, key):
+    flat = cipher.reshape(-1)
+    permutation = _henon_permutation(flat.size, key)
+    hill_flat = np.empty_like(flat)
+    hill_flat[permutation] = flat
+    if hill_flat.size % 2 == 1:
+        plain_bytes = _hill_decrypt_bytes(
+            hill_flat[:-1].tobytes(),
+            key["hill_a"],
+            key["hill_b"],
+        )
+        plain_flat = np.concatenate([np.frombuffer(plain_bytes, dtype=np.uint8), hill_flat[-1:]])
+    else:
+        plain_bytes = _hill_decrypt_bytes(
+            hill_flat.tobytes(),
+            key["hill_a"],
+            key["hill_b"],
+        )
+        plain_flat = np.frombuffer(plain_bytes, dtype=np.uint8)
+    return plain_flat.reshape(cipher.shape).astype(np.uint8)
 
 
 def _encrypt_byte_pairs(data, a, b):
@@ -212,11 +295,21 @@ def henon_decrypt_image(cipher, a=DEFAULT_A, b=DEFAULT_B):
 
 
 def encrypt_text(plaintext, key_payload):
-    a, b = _load_block_key(key_payload)
-    ciphertext, padding = _encrypt_byte_pairs(str(plaintext).encode("utf-8"), a, b)
+    key = _load_secure_key(key_payload)
+    if key["alg"] == HILL_HENON_ALG:
+        ciphertext, padding = _hill_encrypt_bytes(
+            str(plaintext).encode("utf-8"),
+            key["hill_a"],
+            key["hill_b"],
+        )
+        algorithm = HILL_HENON_TEXT_ALG
+    else:
+        a, b = _load_block_key(key_payload)
+        ciphertext, padding = _encrypt_byte_pairs(str(plaintext).encode("utf-8"), a, b)
+        algorithm = "Henon-Map-Block2-Text"
     return json.dumps(
         {
-            "alg": "Henon-Map-Block2-Text",
+            "alg": algorithm,
             "padding": padding,
             "ciphertext": _b64encode(ciphertext),
         },
@@ -227,6 +320,15 @@ def encrypt_text(plaintext, key_payload):
 def decrypt_text(payload, key_payload):
     try:
         data = json.loads(payload)
+        if data.get("alg") == HILL_HENON_TEXT_ALG:
+            key = _load_secure_key(key_payload)
+            plaintext = _hill_decrypt_bytes(
+                _b64decode(data["ciphertext"]),
+                key["hill_a"],
+                key["hill_b"],
+                data.get("padding", 0),
+            )
+            return plaintext.decode("utf-8")
         if data.get("alg") != "Henon-Map-Block2-Text":
             return payload
         a, b = _load_block_key(key_payload)
@@ -247,7 +349,9 @@ def encrypt_image_bytes(image_bytes, key_payload):
     if image is None:
         raise ValueError("Image bytes could not be decoded.")
 
-    if key["alg"] == SECURE_ALG:
+    if key["alg"] == HILL_HENON_ALG:
+        encrypted_image = _encrypt_image_hill_henon(image, key)
+    elif key["alg"] == SECURE_ALG:
         encrypted_image = _encrypt_image_secure(image, key)
     else:
         encrypted_image = henon_encrypt_image(image, key["block_a"], key["block_b"])
@@ -257,7 +361,7 @@ def encrypt_image_bytes(image_bytes, key_payload):
 
     return json.dumps(
         {
-            "alg": "Henon-Map-Block2-Image",
+            "alg": HILL_HENON_IMAGE_ALG if key["alg"] == HILL_HENON_ALG else "Henon-Map-Block2-Image",
             "format": "png",
             "ciphertext": _b64encode(buffer.tobytes()),
         },
@@ -269,7 +373,7 @@ def decrypt_image_bytes(payload, key_payload):
     if isinstance(payload, bytes):
         payload = payload.decode("utf-8")
     data = json.loads(payload)
-    if data.get("alg") != "Henon-Map-Block2-Image":
+    if data.get("alg") not in {"Henon-Map-Block2-Image", HILL_HENON_IMAGE_ALG}:
         raise ValueError("Not a Henon image payload.")
 
     key = _load_secure_key(key_payload)
@@ -278,7 +382,9 @@ def decrypt_image_bytes(payload, key_payload):
     if encrypted_image is None:
         raise ValueError("Encrypted image could not be decoded.")
 
-    if key["alg"] == SECURE_ALG:
+    if key["alg"] == HILL_HENON_ALG:
+        decrypted_image = _decrypt_image_hill_henon(encrypted_image, key)
+    elif key["alg"] == SECURE_ALG:
         decrypted_image = _decrypt_image_secure(encrypted_image, key)
     else:
         decrypted_image = henon_decrypt_image(encrypted_image, key["block_a"], key["block_b"])

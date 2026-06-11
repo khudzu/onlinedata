@@ -8,7 +8,11 @@ import numpy as np
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from django.conf import settings
 
-from main.crypto.henon import henon_encrypt_image
+from main.crypto.henon import (
+    encrypt_image_bytes as henon_encrypt_image_bytes,
+    generate_henon_key,
+    get_payload_ciphertext_bytes,
+)
 
 
 STATIC_IMAGE_DIR = Path(__file__).resolve().parent.parent / "static" / "img"
@@ -114,8 +118,17 @@ def aes_gcm_raw_pixels(img):
     return bytes_to_image(ciphertext, img.shape)
 
 
-def henon_map_encrypt(img):
-    return henon_encrypt_image(img, a=5, b=7)
+def hill_henon_encrypt(img):
+    key = generate_henon_key()
+    ok, buffer = cv2.imencode(".png", img)
+    if not ok:
+        raise ValueError("Could not encode benchmark image.")
+    payload = henon_encrypt_image_bytes(buffer.tobytes(), key)
+    encrypted_png = get_payload_ciphertext_bytes(payload)
+    encrypted = cv2.imdecode(np.frombuffer(encrypted_png, np.uint8), cv2.IMREAD_COLOR)
+    if encrypted is None:
+        raise ValueError("Could not decode encrypted benchmark image.")
+    return encrypted
 
 
 def find_benchmark_image():
@@ -135,7 +148,7 @@ def run_image_encryption_benchmark(runs=3):
     algorithms = {
         "hill_cipher_then_arnold_cat_map": hill_arnold_encrypt,
         "aes_gcm_raw_pixels": aes_gcm_raw_pixels,
-        "henon_map": henon_map_encrypt,
+        "hill_cipher_then_henon_map": hill_henon_encrypt,
     }
     results = []
     started_at = time.perf_counter()
