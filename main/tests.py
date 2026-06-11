@@ -20,6 +20,13 @@ from main.crypto.aes_reed_muller import (
     wrap_aes_key,
     wrap_aes_key_double,
 )
+from main.crypto.henon import (
+    decrypt_image_bytes as henon_decrypt_image_bytes,
+    decrypt_text as henon_decrypt_text,
+    encrypt_image_bytes as henon_encrypt_image_bytes,
+    encrypt_text as henon_encrypt_text,
+    generate_henon_key,
+)
 
 
 @tag('functional')
@@ -107,6 +114,29 @@ class McElieceReedMullerTestCase(TestCase):
         plaintext = decrypt_image_bytes(ciphertext, aes_key)
 
         self.assertEqual(plaintext, image_bytes)
+
+    def test_henon_text_round_trip(self):
+        henon_key = generate_henon_key()
+
+        ciphertext = henon_encrypt_text("rahasia", henon_key)
+        plaintext = henon_decrypt_text(ciphertext, henon_key)
+
+        self.assertEqual(plaintext, "rahasia")
+
+    def test_henon_image_round_trip(self):
+        import cv2
+        import numpy as np
+
+        henon_key = generate_henon_key()
+        image = np.arange(48, dtype=np.uint8).reshape((4, 4, 3))
+        ok, buffer = cv2.imencode(".png", image)
+        self.assertTrue(ok)
+
+        ciphertext = henon_encrypt_image_bytes(buffer.tobytes(), henon_key)
+        plaintext = henon_decrypt_image_bytes(ciphertext, henon_key)
+        restored = cv2.imdecode(np.frombuffer(plaintext, np.uint8), cv2.IMREAD_COLOR)
+
+        self.assertTrue(np.array_equal(restored, image))
 
 
 class MainFunctionalTestCase(FunctionalTestCase):

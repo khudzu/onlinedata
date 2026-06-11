@@ -9,16 +9,19 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.decorators import user_passes_test
 from main.functions.functions import handle_uploaded_file
 from main.crypto.aes_reed_muller import (
-	decrypt_image_bytes,
-	decrypt_text,
-	encrypt_image_bytes,
-	encrypt_text,
-	generate_aes_key,
+	decrypt_image_bytes as aes_decrypt_image_bytes,
+	decrypt_text as aes_decrypt_text,
 	get_payload_ciphertext_bytes,
 	get_payload_ciphertext_text,
 	unwrap_aes_key,
-	wrap_aes_key,
-	wrap_aes_key_double,
+)
+from main.crypto.henon import (
+	decrypt_image_bytes as henon_decrypt_image_bytes,
+	decrypt_text as henon_decrypt_text,
+	encrypt_image_bytes as henon_encrypt_image_bytes,
+	encrypt_text as henon_encrypt_text,
+	generate_henon_key,
+	is_henon_key,
 )
 
 # Create your views here.
@@ -77,6 +80,29 @@ def visible_posts_for(user):
 
 def user_can_access_post(user, post):
 	return user.is_superuser or post.owner_id == user.id
+
+
+def decrypt_post_text_fields(post, decryption_key=None):
+	if is_henon_key(post.aes_key):
+		post.Nama = henon_decrypt_text(post.Nama, post.aes_key)
+		post.Password = henon_decrypt_text(post.Password, post.aes_key)
+		post.Alamat = henon_decrypt_text(post.Alamat, post.aes_key)
+		post.NIK = henon_decrypt_text(post.NIK, post.aes_key)
+		return
+
+	aes_key = unwrap_aes_key(post.aes_key, decryption_key, post.key_salt or None)
+	post.Nama = aes_decrypt_text(post.Nama, aes_key)
+	post.Password = aes_decrypt_text(post.Password, aes_key)
+	post.Alamat = aes_decrypt_text(post.Alamat, aes_key)
+	post.NIK = aes_decrypt_text(post.NIK, aes_key)
+
+
+def decrypt_post_image_bytes(post, encrypted_payload, decryption_key=None):
+	if is_henon_key(post.aes_key):
+		return henon_decrypt_image_bytes(encrypted_payload, post.aes_key)
+
+	aes_key = unwrap_aes_key(post.aes_key, decryption_key, post.key_salt or None)
+	return aes_decrypt_image_bytes(encrypted_payload, aes_key)
 
 
 def ciphertext_preview_png(encrypted_payload):
@@ -227,13 +253,17 @@ def data(request):
 
 	for post in posts:
 		post.image=get_decrypted_image_url(post.image)
-		if post.aes_key and post.key_salt and decryption_key:
+		if post.aes_key and is_henon_key(post.aes_key):
 			try:
-				aes_key = unwrap_aes_key(post.aes_key, decryption_key, post.key_salt)
-				post.Nama=decrypt_text(post.Nama, aes_key)
-				post.Password=decrypt_text(post.Password, aes_key)
-				post.Alamat=decrypt_text(post.Alamat, aes_key)
-				post.NIK=decrypt_text(post.NIK, aes_key)
+				decrypt_post_text_fields(post)
+			except Exception:
+				decryption_error = 'Sebagian data Henon tidak bisa didekripsi.'
+				post.Nama='[gagal dekripsi]'
+				post.Alamat='[gagal dekripsi]'
+				post.NIK='[gagal dekripsi]'
+		elif post.aes_key and post.key_salt and decryption_key:
+			try:
+				decrypt_post_text_fields(post, decryption_key)
 			except Exception:
 				decryption_error = 'Kunci dekripsi salah untuk sebagian data.'
 				post.Nama='[kunci dekripsi salah]'
@@ -241,11 +271,7 @@ def data(request):
 				post.NIK='[kunci dekripsi salah]'
 		elif post.aes_key and not post.key_salt:
 			try:
-				aes_key = unwrap_aes_key(post.aes_key)
-				post.Nama=decrypt_text(post.Nama, aes_key)
-				post.Password=decrypt_text(post.Password, aes_key)
-				post.Alamat=decrypt_text(post.Alamat, aes_key)
-				post.NIK=decrypt_text(post.NIK, aes_key)
+				decrypt_post_text_fields(post)
 			except Exception:
 				decryption_error = 'Sebagian data lama tidak bisa didekripsi.'
 				post.Nama='[gagal dekripsi]'
@@ -327,22 +353,22 @@ def create(request):
 			if img is None:
 				post_form.add_error('image', 'File gambar tidak bisa dibaca.')
 			else:
-				aes_key = generate_aes_key()
-				secured_image_name = f'{uuid4().hex}.aes'
-				encrypted_image = encrypt_image_bytes(uploaded_image_bytes, aes_key)
+				henon_key = generate_henon_key()
+				secured_image_name = f'{uuid4().hex}.henon'
+				encrypted_image = henon_encrypt_image_bytes(uploaded_image_bytes, henon_key)
 
 				ENCRYPTED_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 				(ENCRYPTED_IMAGE_DIR / secured_image_name).write_bytes(encrypted_image)
 
 				PostModel.objects.create(
 						owner		= request.user,
-						Nama 		= encrypt_text(post_form.cleaned_data['nama'], aes_key),
-						Password	= encrypt_text(post_form.cleaned_data['password'], aes_key),
-						NIK		= encrypt_text(post_form.cleaned_data['nik'], aes_key),
+						Nama 		= henon_encrypt_text(post_form.cleaned_data['nama'], henon_key),
+						Password	= henon_encrypt_text(post_form.cleaned_data['password'], henon_key),
+						NIK		= henon_encrypt_text(post_form.cleaned_data['nik'], henon_key),
 						image 		= secured_image_name,
 						image_ciphertext = encrypted_image.decode('utf-8'),
-						Alamat		= encrypt_text(post_form.cleaned_data['alamat'], aes_key),
-						aes_key		= wrap_aes_key_double(aes_key),
+						Alamat		= henon_encrypt_text(post_form.cleaned_data['alamat'], henon_key),
+						aes_key		= henon_key,
 
 					)
 
@@ -366,6 +392,11 @@ def encrypted_image(request, filename):
 
 	image_path = find_stored_image(filename)
 	if image_path:
+		if image_path.suffix == '.henon':
+			return HttpResponse(
+				get_payload_ciphertext_bytes(image_path.read_bytes()),
+				content_type='image/png',
+			)
 		if image_path.suffix == '.aes':
 			return HttpResponse(
 				ciphertext_preview_png(image_path.read_bytes()),
@@ -375,6 +406,11 @@ def encrypted_image(request, filename):
 
 	post = visible_posts_for(request.user).filter(image=requested_name).first()
 	if post and post.image_ciphertext:
+		if is_henon_key(post.aes_key):
+			return HttpResponse(
+				get_payload_ciphertext_bytes(post.image_ciphertext),
+				content_type='image/png',
+			)
 		return HttpResponse(
 			ciphertext_preview_png(post.image_ciphertext.encode('utf-8')),
 			content_type='image/png',
@@ -389,20 +425,19 @@ def decrypted_image(request, filename):
 	post = visible_posts_for(request.user).filter(image=Path(filename).name).first()
 	if post and post.aes_key:
 		decryption_key = request.session.get('decryption_key')
-		if post.key_salt and not decryption_key:
+		if post.key_salt and not decryption_key and not is_henon_key(post.aes_key):
 			raise Http404('Masukkan kunci dekripsi terlebih dahulu.')
 		try:
-			aes_key = unwrap_aes_key(
-				post.aes_key,
-				decryption_key if post.key_salt else None,
-				post.key_salt or None,
-			)
 			encrypted_payload = (
 				image_path.read_bytes()
 				if image_path
 				else post.image_ciphertext.encode('utf-8')
 			)
-			image_bytes = decrypt_image_bytes(encrypted_payload, aes_key)
+			image_bytes = decrypt_post_image_bytes(
+				post,
+				encrypted_payload,
+				decryption_key if post.key_salt and not is_henon_key(post.aes_key) else None,
+			)
 		except (ValueError, KeyError):
 			raise Http404('Gambar tidak bisa didekripsi.')
 		image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)

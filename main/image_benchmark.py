@@ -8,6 +8,8 @@ import numpy as np
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from django.conf import settings
 
+from main.crypto.henon import henon_encrypt_image
+
 
 STATIC_IMAGE_DIR = Path(__file__).resolve().parent.parent / "static" / "img"
 IMAGE_CANDIDATES = [
@@ -112,6 +114,10 @@ def aes_gcm_raw_pixels(img):
     return bytes_to_image(ciphertext, img.shape)
 
 
+def henon_map_encrypt(img):
+    return henon_encrypt_image(img, a=5, b=7)
+
+
 def find_benchmark_image():
     for image_path in IMAGE_CANDIDATES:
         if image_path.exists():
@@ -129,6 +135,7 @@ def run_image_encryption_benchmark(runs=3):
     algorithms = {
         "hill_cipher_then_arnold_cat_map": hill_arnold_encrypt,
         "aes_gcm_raw_pixels": aes_gcm_raw_pixels,
+        "henon_map": henon_map_encrypt,
     }
     results = []
     started_at = time.perf_counter()
