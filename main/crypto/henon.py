@@ -13,6 +13,9 @@ SECURE_ALG = "Henon-Map-Permutation-XOR-v2"
 HILL_HENON_ALG = "Hill-Cipher-Henon-Map"
 HILL_HENON_TEXT_ALG = "Hill-Cipher-Henon-Map-Text"
 HILL_HENON_IMAGE_ALG = "Hill-Cipher-Henon-Map-Image"
+HILL_GINGERBREADMAN_ALG = "Hill-Cipher-Gingerbreadman-Map"
+HILL_GINGERBREADMAN_TEXT_ALG = "Hill-Cipher-Gingerbreadman-Map-Text"
+HILL_GINGERBREADMAN_IMAGE_ALG = "Hill-Cipher-Gingerbreadman-Map-Image"
 DEFAULT_CHAOS_A = 1.4
 DEFAULT_CHAOS_B = 0.3
 
@@ -37,13 +40,11 @@ def generate_henon_key(a=DEFAULT_A, b=DEFAULT_B):
     _modinv(b)
     return json.dumps(
         {
-            "alg": HILL_HENON_ALG,
+            "alg": HILL_GINGERBREADMAN_ALG,
             "hill_a": 2,
             "hill_b": 3,
-            "chaos_a": DEFAULT_CHAOS_A,
-            "chaos_b": DEFAULT_CHAOS_B,
-            "x0": round((secrets.randbelow(800000) + 100000) / 1000000, 6),
-            "y0": round((secrets.randbelow(800000) + 100000) / 1000000, 6),
+            "x0": round((secrets.randbelow(1000000) - 500000) / 1000000, 6),
+            "y0": round((secrets.randbelow(1000000) - 500000) / 1000000, 6),
         },
         separators=(",", ":"),
     )
@@ -51,14 +52,24 @@ def generate_henon_key(a=DEFAULT_A, b=DEFAULT_B):
 
 def is_henon_key(payload):
     try:
-        return json.loads(payload).get("alg") in {LEGACY_ALG, SECURE_ALG, HILL_HENON_ALG}
+        return json.loads(payload).get("alg") in {
+            LEGACY_ALG,
+            SECURE_ALG,
+            HILL_HENON_ALG,
+            HILL_GINGERBREADMAN_ALG,
+        }
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
 
 
 def _load_key_data(payload):
     data = json.loads(payload)
-    if data.get("alg") not in {LEGACY_ALG, SECURE_ALG, HILL_HENON_ALG}:
+    if data.get("alg") not in {
+        LEGACY_ALG,
+        SECURE_ALG,
+        HILL_HENON_ALG,
+        HILL_GINGERBREADMAN_ALG,
+    }:
         raise ValueError("Not a Henon key payload.")
     return data
 
@@ -133,6 +144,35 @@ def _henon_permutation(length, key):
     return np.argsort(sequence, kind="mergesort")
 
 
+def _gingerbreadman_sequence(length, x0, y0):
+    sequence = np.empty(length, dtype=np.float64)
+    x = float(x0)
+    y = float(y0)
+    warmup = 128
+    index = 0
+
+    for step in range(length + warmup):
+        x_new = 1.0 - y + abs(x)
+        y_new = x
+        x, y = x_new, y_new
+        if not np.isfinite(x) or not np.isfinite(y):
+            x = (float(x0) % 1.0) - 0.5
+            y = (float(y0) % 1.0) - 0.5
+        mixed = np.sin((x * 12.9898) + (y * 78.233)) * 43758.5453
+        if step >= warmup:
+            sequence[index] = mixed - np.floor(mixed)
+            index += 1
+        x = ((x + 2.0) % 4.0) - 2.0
+        y = ((y + 2.0) % 4.0) - 2.0
+
+    return sequence
+
+
+def _gingerbreadman_permutation(length, key):
+    sequence = _gingerbreadman_sequence(length, key["x0"], key["y0"])
+    return np.argsort(sequence, kind="mergesort")
+
+
 def _hill_matrix(a, b):
     return np.array([[1, a], [b, a * b + 1]], dtype=np.int64)
 
@@ -163,6 +203,27 @@ def _hill_encrypt_bytes(data, a, b):
 def _hill_decrypt_bytes(data, a, b, padding=0):
     plain, _ = _hill_transform_bytes(data, _hill_inverse_matrix(a, b), padding)
     return plain
+
+
+def _encrypt_bytes_hill_gingerbreadman(data, key):
+    hill_bytes, padding = _hill_encrypt_bytes(data, key["hill_a"], key["hill_b"])
+    hill_values = np.frombuffer(hill_bytes, dtype=np.uint8)
+    permutation = _gingerbreadman_permutation(hill_values.size, key)
+    cipher = hill_values[permutation]
+    return cipher.tobytes(), padding
+
+
+def _decrypt_bytes_hill_gingerbreadman(data, key, padding=0):
+    cipher = np.frombuffer(data, dtype=np.uint8)
+    permutation = _gingerbreadman_permutation(cipher.size, key)
+    hill_values = np.empty_like(cipher)
+    hill_values[permutation] = cipher
+    return _hill_decrypt_bytes(
+        hill_values.tobytes(),
+        key["hill_a"],
+        key["hill_b"],
+        padding,
+    )
 
 
 def _encrypt_image_secure(img, key):
@@ -199,6 +260,41 @@ def _encrypt_image_hill_henon(img, key):
 def _decrypt_image_hill_henon(cipher, key):
     flat = cipher.reshape(-1)
     permutation = _henon_permutation(flat.size, key)
+    hill_flat = np.empty_like(flat)
+    hill_flat[permutation] = flat
+    if hill_flat.size % 2 == 1:
+        plain_bytes = _hill_decrypt_bytes(
+            hill_flat[:-1].tobytes(),
+            key["hill_a"],
+            key["hill_b"],
+        )
+        plain_flat = np.concatenate([np.frombuffer(plain_bytes, dtype=np.uint8), hill_flat[-1:]])
+    else:
+        plain_bytes = _hill_decrypt_bytes(
+            hill_flat.tobytes(),
+            key["hill_a"],
+            key["hill_b"],
+        )
+        plain_flat = np.frombuffer(plain_bytes, dtype=np.uint8)
+    return plain_flat.reshape(cipher.shape).astype(np.uint8)
+
+
+def _encrypt_image_hill_gingerbreadman(img, key):
+    flat = img.reshape(-1)
+    if flat.size % 2 == 1:
+        hill_bytes, _ = _hill_encrypt_bytes(flat[:-1].tobytes(), key["hill_a"], key["hill_b"])
+        hill_flat = np.concatenate([np.frombuffer(hill_bytes, dtype=np.uint8), flat[-1:]])
+    else:
+        hill_bytes, _ = _hill_encrypt_bytes(flat.tobytes(), key["hill_a"], key["hill_b"])
+        hill_flat = np.frombuffer(hill_bytes, dtype=np.uint8)
+    permutation = _gingerbreadman_permutation(hill_flat.size, key)
+    cipher_flat = hill_flat[permutation]
+    return cipher_flat.reshape(img.shape).astype(np.uint8)
+
+
+def _decrypt_image_hill_gingerbreadman(cipher, key):
+    flat = cipher.reshape(-1)
+    permutation = _gingerbreadman_permutation(flat.size, key)
     hill_flat = np.empty_like(flat)
     hill_flat[permutation] = flat
     if hill_flat.size % 2 == 1:
@@ -296,7 +392,13 @@ def henon_decrypt_image(cipher, a=DEFAULT_A, b=DEFAULT_B):
 
 def encrypt_text(plaintext, key_payload):
     key = _load_secure_key(key_payload)
-    if key["alg"] == HILL_HENON_ALG:
+    if key["alg"] == HILL_GINGERBREADMAN_ALG:
+        ciphertext, padding = _encrypt_bytes_hill_gingerbreadman(
+            str(plaintext).encode("utf-8"),
+            key,
+        )
+        algorithm = HILL_GINGERBREADMAN_TEXT_ALG
+    elif key["alg"] == HILL_HENON_ALG:
         ciphertext, padding = _hill_encrypt_bytes(
             str(plaintext).encode("utf-8"),
             key["hill_a"],
@@ -320,6 +422,14 @@ def encrypt_text(plaintext, key_payload):
 def decrypt_text(payload, key_payload):
     try:
         data = json.loads(payload)
+        if data.get("alg") == HILL_GINGERBREADMAN_TEXT_ALG:
+            key = _load_secure_key(key_payload)
+            plaintext = _decrypt_bytes_hill_gingerbreadman(
+                _b64decode(data["ciphertext"]),
+                key,
+                data.get("padding", 0),
+            )
+            return plaintext.decode("utf-8")
         if data.get("alg") == HILL_HENON_TEXT_ALG:
             key = _load_secure_key(key_payload)
             plaintext = _hill_decrypt_bytes(
@@ -349,7 +459,9 @@ def encrypt_image_bytes(image_bytes, key_payload):
     if image is None:
         raise ValueError("Image bytes could not be decoded.")
 
-    if key["alg"] == HILL_HENON_ALG:
+    if key["alg"] == HILL_GINGERBREADMAN_ALG:
+        encrypted_image = _encrypt_image_hill_gingerbreadman(image, key)
+    elif key["alg"] == HILL_HENON_ALG:
         encrypted_image = _encrypt_image_hill_henon(image, key)
     elif key["alg"] == SECURE_ALG:
         encrypted_image = _encrypt_image_secure(image, key)
@@ -361,7 +473,13 @@ def encrypt_image_bytes(image_bytes, key_payload):
 
     return json.dumps(
         {
-            "alg": HILL_HENON_IMAGE_ALG if key["alg"] == HILL_HENON_ALG else "Henon-Map-Block2-Image",
+            "alg": (
+                HILL_GINGERBREADMAN_IMAGE_ALG
+                if key["alg"] == HILL_GINGERBREADMAN_ALG
+                else HILL_HENON_IMAGE_ALG
+                if key["alg"] == HILL_HENON_ALG
+                else "Henon-Map-Block2-Image"
+            ),
             "format": "png",
             "ciphertext": _b64encode(buffer.tobytes()),
         },
@@ -373,7 +491,11 @@ def decrypt_image_bytes(payload, key_payload):
     if isinstance(payload, bytes):
         payload = payload.decode("utf-8")
     data = json.loads(payload)
-    if data.get("alg") not in {"Henon-Map-Block2-Image", HILL_HENON_IMAGE_ALG}:
+    if data.get("alg") not in {
+        "Henon-Map-Block2-Image",
+        HILL_HENON_IMAGE_ALG,
+        HILL_GINGERBREADMAN_IMAGE_ALG,
+    }:
         raise ValueError("Not a Henon image payload.")
 
     key = _load_secure_key(key_payload)
@@ -382,7 +504,9 @@ def decrypt_image_bytes(payload, key_payload):
     if encrypted_image is None:
         raise ValueError("Encrypted image could not be decoded.")
 
-    if key["alg"] == HILL_HENON_ALG:
+    if key["alg"] == HILL_GINGERBREADMAN_ALG:
+        decrypted_image = _decrypt_image_hill_gingerbreadman(encrypted_image, key)
+    elif key["alg"] == HILL_HENON_ALG:
         decrypted_image = _decrypt_image_hill_henon(encrypted_image, key)
     elif key["alg"] == SECURE_ALG:
         decrypted_image = _decrypt_image_secure(encrypted_image, key)

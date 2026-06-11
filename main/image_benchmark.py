@@ -118,7 +118,7 @@ def aes_gcm_raw_pixels(img):
     return bytes_to_image(ciphertext, img.shape)
 
 
-def hill_henon_encrypt(img):
+def hill_gingerbreadman_encrypt(img):
     key = generate_henon_key()
     ok, buffer = cv2.imencode(".png", img)
     if not ok:
@@ -148,7 +148,7 @@ def run_image_encryption_benchmark(runs=3):
     algorithms = {
         "hill_cipher_then_arnold_cat_map": hill_arnold_encrypt,
         "aes_gcm_raw_pixels": aes_gcm_raw_pixels,
-        "hill_cipher_then_henon_map": hill_henon_encrypt,
+        "hill_cipher_then_gingerbreadman_map": hill_gingerbreadman_encrypt,
     }
     results = []
     started_at = time.perf_counter()
